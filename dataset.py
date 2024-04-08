@@ -214,6 +214,3 @@ class TilesDataset(Dataset):
 
         self.transform = orig_transform
 
-
-
-

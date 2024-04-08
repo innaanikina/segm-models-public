@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 # from torchsummary import summary
 from model import get_model
 from torch import nn
+from torch.utils.data import DataLoader
 import sys
 from glob import glob
 import os
@@ -60,12 +61,14 @@ def write_plots_and_visualize(path_to_res, visualize=False, **images):
             plt.xticks([])
             plt.yticks([])
             plt.title(' '.join(name.split('_')).title())
-            plt.imshow(image)
+            # plt.imshow(image)
 
     plt.savefig(path_to_res, bbox_inches='tight')
 
     if visualize:
         plt.show()
+
+    plt.close()
 
 
 def convert_torch_to_8_bit(tensor):
@@ -80,6 +83,21 @@ def convert_torch_to_8_bit(tensor):
     return res
 
 
+def convert_torch_to_8_bit_batch(tensor):
+    b, _, w, h = tensor.shape
+    results = []
+    for batch in range(b):
+        res = tensor[batch].cpu().detach().numpy()
+        res = res.reshape((w, h))
+        max_val = np.max(res)
+        min_val = np.min(res)
+
+        res = 0.0 * res if (max_val - min_val) == 0 else 255.0 * (res - min_val) / (max_val - min_val)
+        res = np.uint8(res)
+        results.append(res)
+    return results
+
+
 # Вычисление IoU для segmentation_models_pytorch версии 0.3.3
 # if mask is not None:
 #     tp, fp, fn, tn = smp.metrics.get_stats(res, mask, mode='binary', threshold=thres)
@@ -91,9 +109,42 @@ def convert_torch_to_8_bit(tensor):
 #     metrics = {'iou': float(iou_score), 'acc': float(accuracy)}
 
 
+def make_prediction_batch(model, batch, tile_size: int, step: int, device, thres: float = 0.5,
+                          mask=None, is_dataset: bool = True):
+    batch = batch.to(device)
+    if mask is not None:
+        mask = mask.to(device)
+    res = model.forward(batch)
+    raw = res.clone()
+    res_low = torch.where(res < thres, res, torch.tensor(0, dtype=res.dtype).to(device))
+    res = torch.where(res >= thres, 1, 0)
+    metrics = None
+    if mask is not None:
+        iou_val = iou(res, mask, eps=1e-7)
+        acc_val = accuracy(res, mask)
+        metrics = {'iou': float(iou_val), 'acc': float(acc_val)}
+        for key in metrics:
+            if math.isnan(metrics[key]):
+                metrics[key] = 0
+
+    res = convert_torch_to_8_bit_batch(res)
+    res_low = convert_torch_to_8_bit_batch(res_low)
+    raw = convert_torch_to_8_bit_batch(raw)
+
+    plot = []
+    binary = []
+    for i in range(len(res)):
+        rgb = np.dstack((res[i], res[i], res[i]))
+        rgb_raw = np.dstack((res_low[i], res_low[i], res_low[i]))
+        binary.append(np.copy(rgb))
+        rgb[res[i] == 255] = (0, 0, 255)
+        plot.append(rgb + rgb_raw)
+    return {'plot': plot, 'binary': binary, 'raw': raw}, metrics
+
+
 def make_prediction(model, image, tile_size: int, step: int, device, thres: float = 0.5,
                     mask=None, is_dataset: bool = True):
-    """Функция для получения выхода сети"""
+    """Функция для получения выхода сети для одного изображения"""
 
     c, w, h = image.shape
     if is_dataset:
@@ -210,12 +261,13 @@ def main():
     parser.add_argument('--cpu', action='store_true', help="use cpu for training")
     parser.add_argument("--device", type=str, default="cuda", help="default=cuda, or cpu")
     # parser.add_argument("-w", "--workers", type=int, default=6, help="default=6")
+    parser.add_argument('-b', '--batch-size', type=int, default=4, help="default=4")
 
     args = parser.parse_args()
     if args.cpu:
         args.device = 'cpu'
 
-    print("Passed arguments: ", str(args).replace(',',',\n'))
+    print("Passed arguments: ", str(args).replace(',', ',\n'))
 
     b_visualize = True if args.vis else False
     b_calc_only_metrics = True if args.vis else False
@@ -345,7 +397,7 @@ def main():
         _model = nn.DataParallel(_model)
         _model.load_state_dict(checkpoint['model_state_dict'])
         _model = _model.module.to(_device)  # убираем nn.DataParallel т.к. с ним не считается на cpu
-    else: # Если обучалась без cuda, то была сохранена без nn.DataParallel
+    else:  # Если обучалась без cuda, то была сохранена без nn.DataParallel
         _model.load_state_dict(checkpoint['model_state_dict'])
 
     _model.eval()
@@ -356,53 +408,60 @@ def main():
         evalfile.write(_metrics_names)  # печатаем шапку .csv файла
 
         mean_metrics = [[], []]
-        for i in range(len(valid_set)):
-            image, mask = valid_set[i]
-            res, metrics = make_prediction(_model, image, _tile_size, _step, _device, thres=args.thres, mask=mask)
-            image_path = valid_set.image_set[i]
-            image = read_image(image_path)
-            if mask is not None:
-                mask = valid_set.read_mask_for_img(image_path)
-            # print(f'res shape is {res.shape}')
-            # print(f'image shape is {image.shape}')
-            # print(f'mask shape is {mask.shape}')
-            filename = os.path.basename(valid_set.image_set[i])
+        valid_loader = DataLoader(valid_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
-            if _b_calc_metrics:
-                # сохраняем в файл для русского экселя
-                evalfile.write(f"{filename}; " + f"{metrics['iou']:.4f}; {metrics['acc']:.4f}\n".replace('.', ','))
-                i = 0
-                for val in metrics.values():
-                    mean_metrics[i].append(val)
-                    i += 1
+        for batch_idx, batch in enumerate(tqdm(valid_loader)):
+            image_t, mask_t = batch
+            res, metrics = make_prediction_batch(_model, image_t, _tile_size,
+                                                 _step, _device, thres=args.thres, mask=mask_t)
+            for i in range(args.batch_size):
+                if batch_idx * args.batch_size + i >= len(valid_set):
+                    break
 
-            if not b_calc_only_metrics:  # Сохраним бинарные картинки
-                if args.binary:
-                    print(f'Save {os.path.join(_output_path, filename)}')
-                    cv2.imwrite(os.path.join(_output_path, filename), cv2.cvtColor(res['binary'], cv2.COLOR_RGB2BGR))
+                image_path = valid_set.image_set[batch_idx * args.batch_size + i]
+                filename = os.path.basename(image_path)
 
-                if args.raw: # Сохраним выход сети без пороговой обработки
-                    print(f'Save {os.path.join(_output_raw_path, filename)}')
-                    cv2.imwrite(os.path.join(_output_raw_path, filename), res['raw'])
+                if _b_calc_metrics:
+                    # сохраняем в файл для русского экселя
+                    evalfile.write(f"{filename}; " + f"{metrics['iou']:.4f}; {metrics['acc']:.4f}\n".replace('.', ','))
+                    j = 0
+                    for val in metrics.values():
+                        mean_metrics[j].append(val)
+                        j += 1
 
-                if args.plots:  # сохраняем снимок/выход сети/ разметку в одну картинку в папку plots
-                    if _b_calc_metrics:
-                        name, ext = filename.split('.')
-                        plot_name = name + f"_iou_{metrics['iou']:.2f}_acc_{metrics['acc']:.2f}." + ext
-                    else:
-                        plot_name = filename
-                    write_plots_and_visualize(  # (path_to_res, visualize=False, **images)
-                        os.path.join(_output_plots_path, plot_name),
-                        visualize=b_visualize,
-                        image=image,
-                        predicted=res['plot'],
-                        mask=mask
-                    )
+                if not b_calc_only_metrics:  # Сохраним бинарные картинки
+                    if args.binary:
+                        # print(f'Save {os.path.join(_output_path, filename)}')
+                        cv2.imwrite(os.path.join(_output_path, filename),
+                                    cv2.cvtColor(res['binary'][i], cv2.COLOR_RGB2BGR))
+
+                    if args.raw:  # Сохраним выход сети без пороговой обработки
+                        # print(f'Save {os.path.join(_output_raw_path, filename)}')
+                        cv2.imwrite(os.path.join(_output_raw_path, filename), res['raw'][i])
+
+                    if args.plots:  # сохраняем снимок/выход сети/ разметку в одну картинку в папку plots
+                        if _b_calc_metrics:
+                            name, ext = filename.split('.')
+                            plot_name = name + f"_iou_{metrics['iou']:.2f}_acc_{metrics['acc']:.2f}." + ext
+                        else:
+                            plot_name = filename
+                        image = read_image(image_path)
+                        if mask_t is not None:
+                            mask = valid_set.read_mask_for_img(image_path)
+                        write_plots_and_visualize(  # (path_to_res, visualize=False, **images)
+                            os.path.join(_output_plots_path, plot_name),
+                            visualize=b_visualize,
+                            image=image,
+                            predicted=res['plot'][i],
+                            mask=mask
+                        )
         if _b_calc_metrics:
             for i in range(len(mean_metrics)):
                 mean_metrics[i] = statistics.mean(mean_metrics[i])
             evalfile.write(f"{'mean_vals'}; " + f"{mean_metrics[0]:.4f}; {mean_metrics[1]:.4f}\n".replace('.', ','))
-            print(f"{'Mean vals over dataset are'}: " + f"iou {mean_metrics[0]:.4f}, acc {mean_metrics[1]:.4f}\n".replace('.', ','))
+            print(
+                f"{'Mean vals over dataset are'}: " + f"iou {mean_metrics[0]:.4f}, acc {mean_metrics[1]:.4f}\n".replace(
+                    '.', ','))
 
 
 if __name__ == '__main__':
